@@ -116,18 +116,18 @@ def get_batch_loss(model, data):
     pred = model(x)
     return F.cross_entropy(pred.transpose(1, 2), y, reduction='mean')
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
-    model.train()
+# for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
+#     model.train()
 
-    for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        batch = next(train_loader)
-        loss = get_batch_loss(model, batch)
-        loss.backward()
+#     for __ in range(GRADIENT_ACCUMULATE_EVERY):
+#         batch = next(train_loader)
+#         loss = get_batch_loss(model, batch)
+#         loss.backward()
 
-    print(f'training loss: {loss.item()}')
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-    optim.step()
-    optim.zero_grad()
+#     print(f'training loss: {loss.item()}')
+#     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+#     optim.step()
+#     optim.zero_grad()
     
 # now to evaluate
 
@@ -178,11 +178,17 @@ model.reformer.layer_modules[0].fn.lsh_attn._return_attn = True
 attn_diff_loss = torch.zeros(NUM_BATCHES)
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='eval'):
     model.eval()
-
     with torch.no_grad():
-        batch = next(val_loader)
-        lsh_attn = partial_forward(model, batch)
-        full_attn = partial_forward(model, batch, use_full_attn=True)
+        # generate random data of the right shape
+        # qk/v shape: (batch * heads, seq, dim / heads)
+        t = 8 # number of heads
+        qk = torch.randn(BATCH_SIZE * 8, SEQ_LEN, 64)
+        v = torch.randn(BATCH_SIZE * 8, SEQ_LEN, 64)
+        attention_module = model.reformer.layer_modules[0].fn
+        lsh_attn_fn = partial(attention_module.lsh_attn, query_len = t, input_mask = None)
+        full_attn_fn = partial(attention_module.full_attn, query_len = t, input_mask = None)
+        _, lsh_attn, _ = process_inputs_chunk(lsh_attn_fn, qk, v, chunks=attention_module.attn_chunks)
+        _, full_attn, _ = process_inputs_chunk(full_attn_fn, qk, v, chunks=attention_module.attn_chunks)
         loss = F.mse_loss(lsh_attn, full_attn)
         attn_diff_loss[i] = loss
 mean = (sum(attn_diff_loss) / len(attn_diff_loss)).item()
