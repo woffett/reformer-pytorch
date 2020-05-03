@@ -12,15 +12,23 @@ from torch.utils.data import DataLoader, Dataset
 # constants
 
 # NUM_BATCHES = int(1e5)
-NUM_BATCHES = 10
+NUM_BATCHES = 100
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 1e-4
 # VALIDATE_EVERY  = 100
-VALIDATE_EVERY  = 5
+VALIDATE_EVERY  = 10
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
-SEQ_LEN = 4096
+SEQ_LEN = 16384
+SEED = 1
+
+# set random seeds
+torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(SEED)
+random.seed(SEED)
 
 # helpers
 
@@ -61,7 +69,7 @@ model = ReformerLM(
     max_seq_len = SEQ_LEN,
     num_tokens = 256,
     heads = 8,
-    bucket_size = 8,
+    bucket_size = 64,
     n_hashes = 4,
     ff_chunks = 10,
     lsh_dropout = 0.1,

@@ -2,10 +2,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Function
+from torch.autograd import Function, Variable
 from functools import partial
 from itertools import chain
 from revtorch import ReversibleBlock, ReversibleSequence
+# from pytorch_memlab import profile, MemReporter
 
 #constants
 
@@ -114,6 +115,27 @@ class SettableArgs(nn.Module):
 # namely that buckets need to be at least 64 with 8 rounds of hashing
 # https://github.com/google/trax/blob/master/trax/layers/research/efficient_attention.py#L442
 
+def print_grad(x, printgrad = False, name=''):
+    if printgrad:
+        if x.grad is None:
+            print('Parameter ' + name + ' has no gradient!')
+        else:
+            print('Parameter ' + name + ' has gradient %.3f' %
+                  torch.norm(x.grad).item())
+
+def print_module_grad(m, printgrad = False, name=''):
+    if printgrad:
+        [print_grad(p, name=n + ':' + n, printgrad=True) for n,p in m.named_parameters()]
+
+def print_norm(x, printnorm = False, name=''):
+    if printnorm:
+        print('Parameter ' + name + ' has norm %.3f' %
+              torch.norm(x).item())
+        
+def print_module_norm(m, printnorm = False, name=''):
+    if printnorm:
+        [print_norm(p, name=n + ':' + n, printnorm=True) for n,p in m.named_parameters()]
+
 class LSHAttention(nn.Module):
     def __init__( self,
                   dropout = 0.,
@@ -173,6 +195,9 @@ class LSHAttention(nn.Module):
 
         dropped_vecs = self.dropout_for_hash(vecs)
         rotated_vecs = torch.einsum('btf,bfhi->bhti', dropped_vecs, random_rotations)
+        # a = dropped_vecs.unsqueeze(1) # insert an extra dimension at index 1
+        # b = random_rotations.transpose(1,2) # bfhi -> bhfi
+        # rotated_vecs = torch.matmul(a,b) # (b,1,t,f) @ (b,h,f,i) -> (b,h,t,i)
 
         if self._rehash_each_round:
             rotated_vecs = torch.cat([rotated_vecs, -rotated_vecs], dim=-1)
@@ -198,7 +223,7 @@ class LSHAttention(nn.Module):
 
         return buckets
 
-    def forward(self, qk, v, query_len = None, input_mask = None, rotations = None):
+    def forward(self, qk, v, query_len = None, input_mask = None, rotations = None, printgrad = False):
         batch_size, seqlen, dim = qk.shape
         query_len = default(query_len, seqlen)
         device = qk.device
@@ -212,6 +237,9 @@ class LSHAttention(nn.Module):
         ticker = torch.arange(self.n_hashes * seqlen, device=device).unsqueeze(0).expand_as(buckets)
         buckets_and_t = seqlen * buckets + (ticker % seqlen)
         buckets_and_t = buckets_and_t.detach()
+
+        # buckets_and_t = Variable(buckets_and_t, requires_grad = True)
+        # buckets_and_t.register_hook(lambda g: print('grad norm: %f' % torch.norm(g).item()))
 
         # Hash-based sort ("s" at the start of variable names means "sorted")
         sbuckets_and_t, sticker = sort_key_val(buckets_and_t, ticker, dim=-1)
@@ -251,6 +279,7 @@ class LSHAttention(nn.Module):
         bkv_t = look_one_back(bkv_t)
 
         # Dot-product attention.
+        
         dots = torch.einsum('bhie,bhje->bhij', bq, bk) * (dim ** -0.5)
         masked_value = max_neg_value(dots)
 
@@ -264,13 +293,13 @@ class LSHAttention(nn.Module):
             del mask
 
         # Causal masking
-        if self.causal:
+        if self.causal:            
             mask = bq_t[:, :, :, None] < bkv_t[:, :, None, :].clamp(max=query_len - 1)
             dots.masked_fill_(mask, masked_value)
             del mask
 
         # Mask out attention to self except when no other targets are available.
-        self_mask = bq_t[:, :, :, None] == bkv_t[:, :, None, :]
+        self_mask = bq_t[:, :, :, None] == bkv_t[:, :, None, :]        
         dots.masked_fill_(self_mask, TOKEN_SELF_ATTN_VALUE)
         del self_mask
 
@@ -315,11 +344,10 @@ class LSHAttention(nn.Module):
             dots = dots - torch.log(dup_counts + 1e-9)
             del dup_counts
 
-        # Softmax.
+        # Softmax.        
         dots_logsumexp = torch.logsumexp(dots, dim=-1, keepdim=True)
-        dots = torch.exp(dots - dots_logsumexp).type(dots.type())
-        dropped_dots = self.dropout(dots)
-
+        dots = torch.exp(dots - dots_logsumexp).type(dots.type())        
+        dropped_dots = self.dropout(dots)        
         bo = torch.einsum('buij,buje->buie', dropped_dots, bv)
         so = torch.reshape(bo, (batch_size, -1, dim))
         slogits = torch.reshape(dots_logsumexp, (batch_size, -1,))
@@ -338,7 +366,7 @@ class LSHAttention(nn.Module):
                 so_grad = batched_index_select(grad_x, sticker)
                 _, slogits_grad = sort_key_val(buckets_and_t, grad_y, dim=-1)
                 return so_grad, slogits_grad
-
+            
         o, logits = UnsortLogits.apply(so, slogits)
         o = torch.reshape(o, (batch_size, self.n_hashes, seqlen, dim))
         logits = torch.reshape(logits, (batch_size, self.n_hashes, seqlen, 1))
@@ -346,8 +374,9 @@ class LSHAttention(nn.Module):
         if query_len != seqlen:
             query_slice = (slice(None), slice(None), slice(0, query_len))
             o, logits = o[query_slice], logits[query_slice]
-
+            
         probs = torch.exp(logits - torch.logsumexp(logits, dim=1, keepdim=True))
+        
         out = torch.sum(o * probs, dim=1)
 
         attn = torch.empty(0, device=device)
@@ -361,7 +390,7 @@ class LSHAttention(nn.Module):
             del attn_unsort
             unsorted_dots = unsorted_dots.reshape(batch_size, self.n_hashes, seqlen, seqlen)
             attn = torch.sum(unsorted_dots[:, :, 0:query_len, :] * probs, dim=1)
-
+        
         # return output, attention matrix, and bucket distribution
         return out, attn, buckets
 
@@ -385,18 +414,18 @@ class FullQKAttention(nn.Module):
         # qk attention requires tokens not attend to self
         i = torch.arange(t)
         dot[:, i, i] = TOKEN_SELF_ATTN_VALUE
-        masked_value = max_neg_value(dot)
+        masked_value = max_neg_value(dot)        
 
         # Input mask for padding in variable lengthed sequences
         if input_mask is not None:
             mask = input_mask[:, :, None] * input_mask[:, None, :]
             mask = F.pad(mask, (0, seq_len - mask.shape[-1]), 'constant', True)
             dot.masked_fill_(~mask, masked_value)
-
+            
         if self.causal:
             i, j = torch.triu_indices(t, t, 1)
             dot[:, i, j] = masked_value
-
+        
         dot = dot.softmax(dim=-1)
         out = torch.einsum('bij,bje->bie', dot, v)
 
