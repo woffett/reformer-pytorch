@@ -8,6 +8,7 @@ import torch
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 
 # constants
 
@@ -75,7 +76,8 @@ model = ReformerLM(
     lsh_dropout = 0.1,
     weight_tie = True,
     causal = True,
-    use_full_attn = False # set this to true for comparison with full attention
+    # use_full_attn = False # set this to true for comparison with full attention
+    attn_type = 'triplet'
 )
 
 model.cuda()
@@ -121,14 +123,24 @@ def get_batch_loss(model, data):
     pred = model(x)
     return F.cross_entropy(pred.transpose(1, 2), y, reduction='mean')
 
+# generating Tensorboard writer
+writer = SummaryWriter()
+
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = get_batch_loss(model, next(train_loader))
+        batch = next(train_loader)
+        loss = get_batch_loss(model, batch)
         loss.backward()
+        x, y = batch
+        triplet_loss = model.triplet_forward(x)
+        triplet_loss.backward()
 
     print(f'training loss: {loss.item()}')
+    print(f'training triplet loss: {triplet_loss.item()}')
+    writer.add_scalar('Loss/train', loss, i)
+    writer.add_scalar('Loss/train_triplet', triplet_loss, i)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
@@ -136,8 +148,14 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = get_batch_loss(model, next(val_loader))
+            batch = next(val_loader)
+            loss = get_batch_loss(model, batch)
+            x, y = batch
+            triplet_loss = model.triplet_loss(x)
+            writer.add_scalar('Loss/val', loss, i)
+            writer.add_scalar('Loss/val_triplet', triplet_loss, i)
             print(f'validation loss: {loss.item()}')
+            print(f'validation loss: {triplet_loss.item()}')
 
     if i % GENERATE_EVERY == 0:
         model.eval()
@@ -155,3 +173,5 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 inp = torch.cat((inp[1:], next_token), dim=0)
 
             print(output_str)
+
+writer.close()

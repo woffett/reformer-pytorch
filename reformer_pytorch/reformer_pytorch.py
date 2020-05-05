@@ -9,7 +9,7 @@ from revtorch import ReversibleBlock, ReversibleSequence
 # from pytorch_memlab import profile, MemReporter
 
 #constants
-
+from math import pi
 TOKEN_SELF_ATTN_VALUE = -5e4 # carefully set for half precision to work
 
 # helper fns
@@ -394,6 +394,196 @@ class LSHAttention(nn.Module):
         # return output, attention matrix, and bucket distribution
         return out, attn, buckets
 
+class TripletLSHAttention(LSHAttention):
+    def __init__(self,
+                 alpha = 1.0, # triplet loss margin
+                 dim = 512, # embedding dimension
+                 seq_len = 1024,
+                 heads = 8, # attention heads
+                 dropout = 0.,
+                 bucket_size = 64,
+                 n_hashes = 8,
+                 causal = False,
+                 allow_duplicate_attention = True,
+                 attend_across_buckets = True,
+                 rehash_each_round = True,
+                 drop_for_hash_rate = 0.0,
+                 random_rotations_per_head = False,
+                 return_attn = False):
+        super().__init__(dropout = dropout,
+                         bucket_size = bucket_size,
+                         n_hashes = n_hashes,
+                         causal = causal,
+                         allow_duplicate_attention = allow_duplicate_attention,
+                         attend_across_buckets = attend_across_buckets,
+                         rehash_each_round = rehash_each_round,
+                         drop_for_hash_rate = drop_for_hash_rate,
+                         random_rotations_per_head = random_rotations_per_head,
+                         return_attn = return_attn)
+        self.alpha = alpha
+        self.seq_len = seq_len
+        self.heads = heads
+        n_buckets = seq_len // bucket_size
+        buckets_dim = n_buckets // 2
+        if self._rehash_each_round:
+            buckets_dim *= n_hashes
+        self.rotations = nn.Linear(dim // self.heads, buckets_dim)
+
+    def extract_rotations(self, batch_size):
+        n_buckets = self.seq_len // self.bucket_size
+        rotations = self.rotations.weight.t().detach() # dim x (buckets * n_hashes / 2)
+        rotations = torch.reshape(rotations, (-1, self.n_hashes, n_buckets // 2))
+        rotations = rotations.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        return rotations
+
+    def triplet_examples(self, qk):
+        '''
+        Given a query vector, extract the highest/lower inner-product
+        vectors from its LSH-sampled self-attention matrix
+        '''
+        batch_size, seqlen, dim = qk.shape
+        device = qk.device
+        rotations = self.extract_rotations(batch_size)
+        # compute the rotated vecs from hash_vectors
+        # | - there's repeated code here, I will clean it up later
+        # | - pretty much the same as LSHAttention forward, except with max/min idxs
+        
+        ### BEGIN REPEATED CODE ###
+        dropped_vecs = self.dropout_for_hash(qk)
+        rotated_vecs = torch.einsum('btf,bfhi->bhti', dropped_vecs, rotations)
+        max_idxs = torch.argmax(rotated_vecs, dim=-1) 
+        min_idxs = torch.argmin(rotated_vecs, dim=-1)
+
+        n_buckets = seqlen // self.bucket_size
+        offsets = torch.arange(self.n_hashes, device=device)
+        offsets = torch.reshape(offsets * n_buckets, (1, -1, 1))
+        max_idxs = max_idxs + offsets
+        min_idxs = min_idxs + offsets
+        buckets = torch.reshape(max_idxs, (batch_size, -1))
+        ticker = torch.arange(self.n_hashes * seqlen, device=device).unsqueeze(0).expand_as(buckets)
+        buckets_and_t = (seqlen * buckets + (ticker % seqlen)).detach()
+        # sorted according to bucket id
+        sbuckets_and_t, sticker = sort_key_val(buckets_and_t, ticker, dim=-1)
+        del ticker
+
+        # detaching
+        sbuckets_and_t = sbuckets_and_t.detach()
+        sticker = sticker.detach()
+
+        st = (sticker % seqlen)
+        sqk = batched_index_select(qk, st)
+
+        # split off the bin axis
+        chunk_size = self.n_hashes * n_buckets
+        bqk = torch.reshape(sqk, (batch_size, chunk_size, -1, dim))
+
+        # Allow each chunk to attend within itself, and also one chunk back. Chunk
+        # boundaries might occur in the middle of a sequence of items from the
+        # same bucket, so this increases the chances of attending to relevant items.
+        def look_one_back(x):
+            x_extra = torch.cat([x[:, -1:, ...], x[:, :-1, ...]], dim=1)
+            return torch.cat([x, x_extra], dim=2)
+        
+        bk = look_one_back(bqk)
+        del sqk
+        del bqk
+        ### END REPEATED CODE ###
+        # now, bk has shape (batch x C x S x dim)
+        #  - C = n_hashes * n_buckets, the number of chunks to attend over
+        #  - S = 2 * seqlen / n_buckets, chunks concat'd w/ prev. chunk
+
+        # reshape min/max idxs to batch x (seqlen*n_hashes)
+        max_idxs = torch.reshape(torch.transpose(max_idxs,-1,-2),
+                                 (batch_size, -1))
+        min_idxs = torch.reshape(torch.transpose(min_idxs,-1,-2),
+                                 (batch_size, -1))
+        
+        # batch index select over last two dimensions
+        def batched_index_select2(values, indices):
+            last_dim = values.shape[-1]
+            snd_last_dim = values.shape[-2]
+            return values.gather(
+                1,
+                indices[:,:,None,None].expand(-1,-1,snd_last_dim, last_dim)
+            )
+        max_batches = batched_index_select2(bk, max_idxs)
+        min_batches = batched_index_select2(bk, min_idxs)
+        # reshape to make dot product easier
+        max_batches = max_batches.reshape(-1, seqlen, self.n_hashes,
+                                          seqlen // n_buckets * 2, dim)
+        min_batches = min_batches.reshape(-1, seqlen, self.n_hashes,
+                                          seqlen // n_buckets * 2, dim)
+
+        # perform dot product between qk and the vectors it attends over
+        # result is (batch x seqlen x n_hashes x (2*seqlen/n_hashes))
+        max_self_attn = torch.einsum('bthkd,btdz->bthkz', max_batches,
+                                     qk.unsqueeze(-1)).squeeze(-1)
+        min_self_attn = torch.einsum('bthkd,btdz->bthkz', min_batches,
+                                     qk.unsqueeze(-1)).squeeze(-1)
+
+        # find the indices of the maximum dot prod. across all n_hashes
+        max_self_attn_idxs = torch.argmax(
+            max_self_attn.reshape(batch_size, seqlen, -1),
+            dim=-1).unsqueeze(-1)        
+        min_self_attn_idxs = torch.argmin(
+            min_self_attn.reshape(batch_size, seqlen, -1),
+            dim=-1).unsqueeze(-1)
+
+        # select along second last dim
+        min_batches = min_batches.reshape(batch_size, seqlen, -1, dim)
+        max_batches = max_batches.reshape(batch_size, seqlen, -1, dim)
+        pos_vectors = max_batches.gather(
+            2,
+            max_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
+        ).squeeze(-2)
+        neg_vectors = min_batches.gather(
+            2,
+            min_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
+        ).squeeze(-2)
+
+        # pos/neg_vectors have same shape as qk
+        return pos_vectors.detach(), neg_vectors.detach()
+
+    def triplet_forward(self,
+                        x, # input
+                        p, # positive example
+                        n, # negative example
+    ):
+        '''
+        Given inputs, positive and negative examples, compute the 
+        triplet loss given by cosine similarity
+        '''
+        emb_x = self.rotations(x)
+        emb_p = self.rotations(p)
+        emb_n = self.rotations(n)
+
+        # cosine similarity
+        sim_xp = F.cosine_similarity(emb_x, emb_p, dim=-1)
+        sim_xn = F.cosine_similarity(emb_x, emb_n, dim=-1)
+
+        # distance in radians
+        # dis_xp = 1 - torch.acos(sim_xp)/pi
+        # dis_xn = 1 - torch.acos(sim_xn)/pi
+        dis_xp = 1 - sim_xp
+        dis_xn = 1 - sim_xn
+
+        triplet_loss = dis_xp - dis_xn + self.alpha
+        triplet_loss = torch.mean(torch.max(triplet_loss,
+                                            torch.zeros(triplet_loss.size()).to(x.device)))
+        return triplet_loss
+
+    def forward(self, qk, v, query_len = None, input_mask = None, printgrad = False):
+        batch_size, seqlen, dim = qk.shape
+        n_buckets = self.seq_len // self.bucket_size
+        rotations = self.extract_rotations(batch_size)
+        out, attn, buckets = super().forward(qk, v,
+                                             query_len = query_len,
+                                             input_mask = input_mask,
+                                             rotations = rotations,
+                                             printgrad = printgrad)
+            
+        return out, attn, buckets
+
 # simple full attention
 
 class FullQKAttention(nn.Module):
@@ -434,7 +624,7 @@ class FullQKAttention(nn.Module):
 # Shared qk attention, using either full or LSH attention
 
 class LSHSelfAttention(nn.Module):
-    def __init__(self, dim, heads = 8, bucket_size = 64, n_hashes = 8, causal = False, attn_chunks = None, random_rotations_per_head = False, attend_across_buckets = True, allow_duplicate_attention = True, num_mem_kv = 0, use_full_attn = False, full_attn_thres = None, return_attn = False, parameterized_rotations = False, max_seq_len = None, batch = None, **kwargs):
+    def __init__(self, dim, heads = 8, bucket_size = 64, n_hashes = 8, causal = False, attn_chunks = None, random_rotations_per_head = False, attend_across_buckets = True, allow_duplicate_attention = True, num_mem_kv = 0, attn_type = 'lsh', full_attn_thres = None, return_attn = False, parameterized_rotations = False, max_seq_len = None, batch = None, alpha = 1.0, **kwargs):
         super().__init__()
         assert dim % heads == 0, 'dimensions must be divisible by number of heads'
 
@@ -445,24 +635,30 @@ class LSHSelfAttention(nn.Module):
         self.toqk = nn.Linear(dim, dim, bias = False)
         self.tov = nn.Linear(dim, dim, bias = False)
         self.to_out = nn.Linear(dim, dim)
-        self.rotations = None
-        self.rotations_norm = None
-        if parameterized_rotations:
-            print('Generating parameterized rotations!')
-            rot_size = max_seq_len // bucket_size
-            rotations_shape = (
-                batch if random_rotations_per_head else 1,
-                dim // heads,
-                n_hashes,
-                rot_size // 2)
-            self.rotations = nn.Parameter(torch.randn(*rotations_shape, requires_grad=True).expand(batch, -1, -1, -1))
-            self.rotations_norm = torch.norm(self.rotations).item() # to see if we're actually updating the parameter
 
         self.bucket_size = bucket_size
         self.lsh_attn = LSHAttention(bucket_size=bucket_size, n_hashes=n_hashes, causal=causal, random_rotations_per_head=random_rotations_per_head, attend_across_buckets = attend_across_buckets,  allow_duplicate_attention = allow_duplicate_attention, return_attn = return_attn, **kwargs)
+        
+        self.triplet_lsh_attn = TripletLSHAttention(
+            alpha = alpha,
+            dim = self.dim,
+            seq_len = max_seq_len,
+            heads = self.heads,
+            bucket_size = bucket_size, n_hashes = n_hashes, causal = causal,
+            random_rotations_per_head = random_rotations_per_head,
+            attend_across_buckets = attend_across_buckets,
+            allow_duplicate_attention = allow_duplicate_attention,
+            return_attn = return_attn,
+            **kwargs
+        )
         self.full_attn = FullQKAttention(causal = causal)
+        self.attentions = {
+            'lsh': self.lsh_attn,
+            'full': self.full_attn,
+            'triplet': self.triplet_lsh_attn
+        }
 
-        self.use_full_attn = use_full_attn
+        self.attn_type = attn_type
         self.full_attn_thres = default(full_attn_thres, bucket_size)
 
         self.num_mem_kv = num_mem_kv
@@ -478,16 +674,10 @@ class LSHSelfAttention(nn.Module):
         keys = default(keys, torch.empty(b, 0, e, dtype=mem.dtype, device=device))
 
         kv_len = t + m + keys.shape[1]
-        use_full_attn = self.use_full_attn or kv_len <= self.full_attn_thres
+        use_full_attn = self.attn_type == 'full' or kv_len <= self.full_attn_thres
 
         if not use_full_attn:
             assert not use_full_attn and (kv_len % self.bucket_size == 0), f'Sequence length needs to be divisible by target bucket size - {self.bucket_size}'
-
-        if self.rotations is not None:
-            cur_norm = torch.norm(self.rotations).item()
-            if cur_norm != self.rotations_norm:
-                print('Rotation parameter updated!')
-                self.rotations_norm = cur_norm
 
         x = torch.cat((x, mem, keys), dim=1)
         qk = self.toqk(x)
@@ -502,9 +692,10 @@ class LSHSelfAttention(nn.Module):
         qk = merge_heads(qk)
         v = merge_heads(v)
 
-        attn_fn = self.lsh_attn if not use_full_attn else self.full_attn
-        partial_attn_fn = partial(attn_fn, query_len = t, input_mask = input_mask, rotations = self.rotations)
-        out, attn, buckets = process_inputs_chunk(partial_attn_fn, qk, v, chunks=self.attn_chunks)
+        attn_fn = self.attentions[self.attn_type]
+        partial_attn_fn = partial(attn_fn, query_len = t, input_mask = input_mask)
+        out, attn, buckets = process_inputs_chunk(partial_attn_fn,
+                                                            qk, v, chunks=self.attn_chunks)
         out = split_heads(out).view(b, t, e)
 
         if self.callback is not None:
@@ -532,12 +723,12 @@ class FeedForward(nn.Module):
 # reformer lm
 
 class Reformer(nn.Module):
-    def __init__(self, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., lsh_attend_across_buckets = True, lsh_allow_duplicate_attention = True, random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, use_full_attn = False, full_attn_thres = None, num_mem_kv = 0, parameterized_rotations = False, batch = None):
+    def __init__(self, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., lsh_attend_across_buckets = True, lsh_allow_duplicate_attention = True, random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, attn_type = 'lsh', full_attn_thres = None, num_mem_kv = 0, parameterized_rotations = False, batch = None):
         super().__init__()
         self.dim = dim
         self.depth = depth
 
-        get_attn = lambda: SettableArgs(LSHSelfAttention(dim, heads, bucket_size, n_hashes, causal = causal, dropout = lsh_dropout, attn_chunks = attn_chunks, allow_duplicate_attention = lsh_allow_duplicate_attention, attend_across_buckets = lsh_attend_across_buckets, random_rotations_per_head = random_rotations_per_head, num_mem_kv = num_mem_kv, use_full_attn = use_full_attn, full_attn_thres = full_attn_thres, parameterized_rotations = parameterized_rotations, max_seq_len = max_seq_len, batch = batch))
+        get_attn = lambda: SettableArgs(LSHSelfAttention(dim, heads, bucket_size, n_hashes, causal = causal, dropout = lsh_dropout, attn_chunks = attn_chunks, allow_duplicate_attention = lsh_allow_duplicate_attention, attend_across_buckets = lsh_attend_across_buckets, random_rotations_per_head = random_rotations_per_head, num_mem_kv = num_mem_kv, attn_type = attn_type, full_attn_thres = full_attn_thres, parameterized_rotations = parameterized_rotations, max_seq_len = max_seq_len, batch = batch))
         get_ff = lambda: FeedForward(dim)
 
         if weight_tie:
@@ -574,14 +765,15 @@ class Reformer(nn.Module):
         return torch.stack(x.chunk(2, dim=-1)).sum(dim=0)
 
 class ReformerLM(nn.Module):
-    def __init__(self, num_tokens, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, use_full_attn = False, full_attn_thres = None, num_mem_kv = 0, emb_dim = None, return_embeddings = False, fixed_position_emb = False, parameterized_rotations = False, batch = None):
+    def __init__(self, num_tokens, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, attn_type = 'lsh', full_attn_thres = None, num_mem_kv = 0, emb_dim = None, return_embeddings = False, fixed_position_emb = False, parameterized_rotations = False, batch = None):
         super().__init__()
         emb_dim = default(emb_dim, dim)
         self.token_emb = nn.Embedding(num_tokens, emb_dim)
         self.pos_emb = FixedPositionEmbedding(emb_dim) if fixed_position_emb else nn.Embedding(max_seq_len, emb_dim)
         self.to_model_dim = identity if emb_dim == dim else nn.Linear(emb_dim, dim)
+        self.dim = dim
 
-        self.reformer = Reformer(dim, depth, max_seq_len, heads = heads, bucket_size = bucket_size, n_hashes = n_hashes, ff_chunks = ff_chunks, attn_chunks = attn_chunks, causal = causal, weight_tie = weight_tie, lsh_dropout = lsh_dropout, random_rotations_per_head = random_rotations_per_head, twin_attention = twin_attention, use_scale_norm = use_scale_norm, use_full_attn = use_full_attn, full_attn_thres = full_attn_thres, num_mem_kv = num_mem_kv, parameterized_rotations = parameterized_rotations, batch = batch)
+        self.reformer = Reformer(dim, depth, max_seq_len, heads = heads, bucket_size = bucket_size, n_hashes = n_hashes, ff_chunks = ff_chunks, attn_chunks = attn_chunks, causal = causal, weight_tie = weight_tie, lsh_dropout = lsh_dropout, random_rotations_per_head = random_rotations_per_head, twin_attention = twin_attention, use_scale_norm = use_scale_norm, attn_type = attn_type, full_attn_thres = full_attn_thres, num_mem_kv = num_mem_kv, parameterized_rotations = parameterized_rotations, batch = batch)
         self.to_logits = identity if return_embeddings else nn.Linear(dim, num_tokens)
 
     def forward(self, x, **kwargs):
@@ -592,3 +784,85 @@ class ReformerLM(nn.Module):
         x = self.to_model_dim(x)
         x = self.reformer(x, **kwargs)
         return self.to_logits(x)
+
+    def triplet_forward(self, x, **kwargs):
+        '''
+        Does a partial forward pass to calculate triplet losses,
+        followed by backwards propagating all losses
+        '''
+        t = torch.arange(x.shape[1], device=x.device)
+        x = self.token_emb(x)
+        x = x + self.pos_emb(t).type(x.type())
+        x = self.to_model_dim(x)
+
+        # reformer forward
+        x = torch.cat([x, x], dim=-1)
+
+        # 1 item for each LSHAttention layer
+        losses = []
+        for i in range(len(self.reformer.layer_modules)//2):
+            x1, x2 = torch.chunk(x, 2, dim=-1)
+            b, t, e = x1.shape
+            f = self.reformer.layer_modules[2*i].fn
+            g = self.reformer.layer_modules[(2*i)+1].fn
+
+            # need to artificially re-insert normalization
+            x1 = F.layer_norm(x1, (self.dim,))
+            x2 = F.layer_norm(x2, (self.dim,))
+            
+            y2 = g(x2)
+
+            # need to freeze non-LSH params
+            def freeze_linear(l, bias = True):
+                l.weight.requires_grad = False
+                if bias:
+                    l.bias.requires_grad = False
+
+            freeze_linear(f.toqk, bias = False)
+            freeze_linear(f.tov, bias = False)
+            freeze_linear(f.to_out)
+
+            h = f.heads
+            qk = f.toqk(x1)
+            v = f.tov(x1)
+
+            kv_len = t
+            
+            def merge_heads(v):
+                return v.view(b, kv_len, h, -1).transpose(1, 2).reshape(b * h, kv_len, -1)
+
+            def split_heads(v):
+                return v.view(b, h, t, -1).transpose(1, 2).contiguous()
+            
+            qk = merge_heads(qk)
+            v = merge_heads(v)
+            attn_fn = f.triplet_lsh_attn
+            partial_attn_fn = partial(attn_fn, query_len = t, input_mask = None)
+            # first, calculate the loss
+            pos_vectors, neg_vectors = process_inputs_chunk(attn_fn.triplet_examples,
+                                                            qk, chunks=f.attn_chunks)
+            loss = attn_fn.triplet_forward(qk, pos_vectors, neg_vectors)
+            losses.append(loss)
+
+            # next, do regular attention so we can continue calculation for future layers
+            out, attn, buckets = process_inputs_chunk(partial_attn_fn,
+                                                      qk, v, chunks=f.attn_chunks)
+            out = split_heads(out).view(b, t, e)
+            y1 = f.to_out(out)
+
+            # unfreeze linear layers
+            def unfreeze_linear(l, bias = True):
+                l.weight.requires_grad = True
+                if bias:
+                    l.bias.requires_grad = True
+
+            unfreeze_linear(f.toqk, bias = False)
+            unfreeze_linear(f.tov, bias = False)
+            unfreeze_linear(f.to_out)
+
+            # combine y1 and y2 in reversible block style
+            y1 += x1
+            y2 += x2
+            x = torch.cat([y1, y2], dim=-1)
+
+        return sum(losses)
