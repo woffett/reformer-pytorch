@@ -21,7 +21,7 @@ LEARNING_RATE = 1e-4
 VALIDATE_EVERY  = 10
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
-SEQ_LEN = 16384
+SEQ_LEN = 4096
 ATTN_TYPE = 'triplet'
 SEED = 1
 
@@ -118,11 +118,7 @@ optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 def get_batch_loss(model, data):
     x, y = data
-    # with torch.cuda.profiler.profile():
-    #     model(x)
-    #     with torch.autograd.profiler.emit_nvtx():
-    #         pred = model(x)
-    pred = model(x)
+    pred = model(x, calc_triplet = True)
     return F.cross_entropy(pred.transpose(1, 2), y, reduction='mean')
 
 # generating Tensorboard writer
@@ -145,8 +141,9 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     # now for triplet loss
     if ATTN_TYPE == 'triplet':
         triplet_loss = model.get_triplet_loss()
-        print(f'training triplet loss: {triplet_loss.item()}')
-        writer.add_scalar('Loss/train_triplet', triplet_loss, i)
+        # for logging, show mean loss
+        print(f'training triplet loss: {triplet_loss.item()/GRADIENT_ACCUMULATE_EVERY}')
+        writer.add_scalar('Loss/train_triplet', triplet_loss/GRADIENT_ACCUMULATE_EVERY, i)
         triplet_loss.backward()
 
     model.clear_non_rotation_gradients()
@@ -154,7 +151,6 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
-
     
     if i % VALIDATE_EVERY == 0:
         model.eval()
@@ -166,7 +162,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
             if ATTN_TYPE == 'triplet':
                 triplet = model.get_triplet_loss()
                 writer.add_scalar('Loss/val_triplet', triplet_loss, i)
-                print(f'validation loss: {triplet_loss.item()}')
+                print(f'validation triplet loss: {triplet_loss.item()/GRADIENT_ACCUMULTE_EVERY}')
                 model.clear_triplet_loss()
 
     if i % GENERATE_EVERY == 0:

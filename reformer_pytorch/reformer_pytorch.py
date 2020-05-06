@@ -664,7 +664,7 @@ class LSHSelfAttention(nn.Module):
         self.callback = None
         self.triplet_loss = None
 
-    def forward(self, x, keys = None, input_mask = None):
+    def forward(self, x, keys = None, input_mask = None, calc_triplet = False):
         device = x.device
         b, t, e, h, m = *x.shape, self.heads, self.num_mem_kv
 
@@ -699,7 +699,7 @@ class LSHSelfAttention(nn.Module):
         if self.callback is not None:
             self.callback(attn.reshape(b, h, t, -1), buckets.reshape(b, h, -1))
 
-        if self.attn_type == 'triplet':
+        if self.attn_type == 'triplet' and calc_triplet:
             pos_vectors, neg_vectors = process_inputs_chunk(
                 self.lsh_attn.triplet_examples,
                 qk, chunks=self.attn_chunks)
