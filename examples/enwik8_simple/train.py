@@ -22,6 +22,7 @@ VALIDATE_EVERY  = 10
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 16384
+ATTN_TYPE = 'triplet'
 SEED = 1
 
 # set random seeds
@@ -77,7 +78,8 @@ model = ReformerLM(
     weight_tie = True,
     causal = True,
     # use_full_attn = False # set this to true for comparison with full attention
-    attn_type = 'triplet'
+    attn_type = ATTN_TYPE,
+    triplet_chunks = 512
 )
 
 model.cuda()
@@ -133,29 +135,39 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         batch = next(train_loader)
         loss = get_batch_loss(model, batch)
         loss.backward()
-        x, y = batch
-        triplet_loss = model.triplet_forward(x)
-        triplet_loss.backward()
 
     print(f'training loss: {loss.item()}')
-    print(f'training triplet loss: {triplet_loss.item()}')
     writer.add_scalar('Loss/train', loss, i)
-    writer.add_scalar('Loss/train_triplet', triplet_loss, i)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
+
+    # now for triplet loss
+    if ATTN_TYPE == 'triplet':
+        triplet_loss = model.get_triplet_loss()
+        print(f'training triplet loss: {triplet_loss.item()}')
+        writer.add_scalar('Loss/train_triplet', triplet_loss, i)
+        triplet_loss.backward()
+
+    model.clear_non_rotation_gradients()
+    model.clear_triplet_loss()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+    optim.step()
+    optim.zero_grad()
+
     
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
             batch = next(val_loader)
             loss = get_batch_loss(model, batch)
-            x, y = batch
-            triplet_loss = model.triplet_loss(x)
             writer.add_scalar('Loss/val', loss, i)
-            writer.add_scalar('Loss/val_triplet', triplet_loss, i)
-            print(f'validation loss: {loss.item()}')
-            print(f'validation loss: {triplet_loss.item()}')
+            print(f'validation loss: {loss.item()}')            
+            if ATTN_TYPE == 'triplet':
+                triplet = model.get_triplet_loss()
+                writer.add_scalar('Loss/val_triplet', triplet_loss, i)
+                print(f'validation loss: {triplet_loss.item()}')
+                model.clear_triplet_loss()
 
     if i % GENERATE_EVERY == 0:
         model.eval()
