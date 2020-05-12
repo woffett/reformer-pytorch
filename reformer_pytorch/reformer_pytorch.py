@@ -462,7 +462,6 @@ class TripletLSHAttention(LSHAttention):
         offsets = torch.arange(self.n_hashes, device=device)
         offsets = torch.reshape(offsets * n_buckets, (1, -1, 1))
         max_idxs = max_idxs + offsets
-        min_idxs = min_idxs + offsets
         buckets = torch.reshape(max_idxs, (batch_size, -1))
         ticker = torch.arange(self.n_hashes * seqlen, device=device).unsqueeze(0).expand_as(buckets)
         buckets_and_t = (seqlen * buckets + (ticker % seqlen)).detach()
@@ -499,8 +498,6 @@ class TripletLSHAttention(LSHAttention):
         # reshape min/max idxs to batch x (seqlen*n_hashes)
         max_idxs = torch.reshape(torch.transpose(max_idxs,-1,-2),
                                  (batch_size, -1))
-        min_idxs = torch.reshape(torch.transpose(min_idxs,-1,-2),
-                                 (batch_size, -1))
         
         # batch index select over last two dimensions
         def batched_index_select2(values, indices):
@@ -511,19 +508,15 @@ class TripletLSHAttention(LSHAttention):
                 indices[:,:,None,None].expand(-1,-1,snd_last_dim, last_dim)
             )
 
-        def pos_neg_examples(min_idxs, max_idxs, qk, bk):
+        def pos_neg_examples(max_idxs, qk, bk):
             max_batches = batched_index_select2(bk, max_idxs)
-            min_batches = batched_index_select2(bk, min_idxs)
+            
             # reshape to make dot product easier
             max_batches = max_batches.reshape(batch_size, -1, self.n_hashes,
-                                              seqlen // n_buckets * 2, dim)
-            min_batches = min_batches.reshape(batch_size, -1, self.n_hashes,
                                               seqlen // n_buckets * 2, dim)
 
             # perform dot product between qk and the vectors it attends over
             max_self_attn = torch.einsum('bthkd,btdz->bthkz', max_batches,
-                                         qk.unsqueeze(-1)).squeeze(-1)
-            min_self_attn = torch.einsum('bthkd,btdz->bthkz', min_batches,
                                          qk.unsqueeze(-1)).squeeze(-1)
             
             # find the indices of the maximum dot prod. across all n_hashes
@@ -531,19 +524,17 @@ class TripletLSHAttention(LSHAttention):
                 max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
                 dim=-1).unsqueeze(-1)        
             min_self_attn_idxs = torch.argmin(
-                min_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
+                max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
                 dim=-1).unsqueeze(-1)
 
             # select along second last dim
-            min_batches = min_batches.reshape(batch_size, -1,
-                                              self.n_hashes * seqlen // n_buckets * 2, dim)
             max_batches = max_batches.reshape(batch_size, -1,
                                               self.n_hashes * seqlen // n_buckets * 2, dim)
             pos_vectors = max_batches.gather(
             2,
             max_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
             ).squeeze(-2)
-            neg_vectors = min_batches.gather(
+            neg_vectors = max_batches.gather(
                 2,
                 min_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
             ).squeeze(-2)
@@ -552,7 +543,7 @@ class TripletLSHAttention(LSHAttention):
 
         partial_select_fn = partial(pos_neg_examples, bk = bk)
         pos_vectors, neg_vectors = process_inputs_chunk(
-            partial_select_fn, min_idxs, max_idxs, qk, chunks=self.triplet_chunks, dim=1
+            partial_select_fn, max_idxs, qk, chunks=self.triplet_chunks, dim=1
         )
         return pos_vectors, neg_vectors
 
@@ -573,7 +564,7 @@ class TripletLSHAttention(LSHAttention):
         sim_xp = F.cosine_similarity(emb_x, emb_p, dim=-1)
         sim_xn = F.cosine_similarity(emb_x, emb_n, dim=-1)
 
-        # distance in radians
+        # # distance in radians
         # dis_xp = 1 - torch.acos(sim_xp)/pi
         # dis_xn = 1 - torch.acos(sim_xn)/pi
         dis_xp = 1 - sim_xp

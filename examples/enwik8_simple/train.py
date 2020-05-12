@@ -162,7 +162,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
             if ATTN_TYPE == 'triplet':
                 triplet = model.get_triplet_loss()
                 writer.add_scalar('Loss/val_triplet', triplet_loss, i)
-                print(f'validation triplet loss: {triplet_loss.item()/GRADIENT_ACCUMULTE_EVERY}')
+                print(f'validation triplet loss: {triplet_loss.item()}')
                 model.clear_triplet_loss()
 
     if i % GENERATE_EVERY == 0:
