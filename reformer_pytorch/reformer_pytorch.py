@@ -817,3 +817,9 @@ class ReformerLM(nn.Module):
             f = self.reformer.layer_modules[2*i].fn
             if f.triplet_loss is not None:
                 f.triplet_loss = None
+
+    def save_triplet_params(self, prefix):
+        for i in range(len(self.reformer.layer_modules)//2):
+            f = self.reformer.layer_modules[2*i].fn
+            weight = f.lsh_attn.rotations.weight
+            torch.save(weight, prefix + '%d.pt' % i)

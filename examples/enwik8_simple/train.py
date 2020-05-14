@@ -17,12 +17,13 @@ NUM_BATCHES = 100
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 1e-4
+TRIPLET_LEARNING_RATE = 0.00075
 # VALIDATE_EVERY  = 100
 VALIDATE_EVERY  = 10
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 4096
-ATTN_TYPE = 'triplet'
+ATTN_TYPE = 'lsh'
 SEED = 1
 
 # set random seeds
@@ -113,6 +114,7 @@ val_loader    = cycle(DataLoader(val_dataset, batch_size = BATCH_SIZE))
 # optimizer
 
 optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+triplet_optim = torch.optim.Adam(model.parameters(), lr=TRIPLET_LEARNING_RATE)
 
 # training
 
@@ -145,12 +147,11 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         print(f'training triplet loss: {triplet_loss.item()/GRADIENT_ACCUMULATE_EVERY}')
         writer.add_scalar('Loss/train_triplet', triplet_loss/GRADIENT_ACCUMULATE_EVERY, i)
         triplet_loss.backward()
-
-    model.clear_non_rotation_gradients()
-    model.clear_triplet_loss()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-    optim.step()
-    optim.zero_grad()
+        model.clear_non_rotation_gradients()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        triplet_optim.step()
+        triplet_optim.zero_grad()
+        model.clear_triplet_loss()
     
     if i % VALIDATE_EVERY == 0:
         model.eval()
@@ -165,21 +166,21 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 print(f'validation triplet loss: {triplet_loss.item()}')
                 model.clear_triplet_loss()
 
-    if i % GENERATE_EVERY == 0:
-        model.eval()
-        with torch.no_grad():
-            inp, _ = random.choice(val_dataset)
-            output_str = ''
-            prime = decode_tokens(inp)
+    # if i % GENERATE_EVERY == 0:
+    #     model.eval()
+    #     with torch.no_grad():
+    #         inp, _ = random.choice(val_dataset)
+    #         output_str = ''
+    #         prime = decode_tokens(inp)
 
-            print(f'%s \n\n %s', (prime, '*' * 100))
+    #         print(f'%s \n\n %s', (prime, '*' * 100))
 
-            for _ in tqdm.tqdm(range(GENERATE_LENGTH), desc='generating'):
-                logits = model(inp[None, :])
-                next_token = sample_next_token(logits)
-                output_str += decode_token(next_token)
-                inp = torch.cat((inp[1:], next_token), dim=0)
+    #         for _ in tqdm.tqdm(range(GENERATE_LENGTH), desc='generating'):
+    #             logits = model(inp[None, :])
+    #             next_token = sample_next_token(logits)
+    #             output_str += decode_token(next_token)
+    #             inp = torch.cat((inp[1:], next_token), dim=0)
 
-            print(output_str)
+    #         print(output_str)
 
 writer.close()
