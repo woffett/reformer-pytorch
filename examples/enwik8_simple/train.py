@@ -36,6 +36,8 @@ random.seed(SEED)
 
 # helpers
 
+torch.autograd.set_detect_anomaly(True)
+
 def cycle(loader):
     while True:
         for data in loader:
@@ -120,9 +122,9 @@ triplet_optim = torch.optim.Adam(model.parameters(), lr=TRIPLET_LEARNING_RATE)
 
 # training
 
-def get_batch_loss(model, data):
+def get_batch_loss(model, data, train=True):
     x, y = data
-    pred = model(x, calc_triplet = True)
+    pred = model(x, calc_triplet = train)
     return F.cross_entropy(pred.transpose(1, 2), y, reduction='mean')
 
 # generating Tensorboard writer
@@ -170,7 +172,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         model.eval()
         with torch.no_grad():
             batch = next(val_loader)
-            loss = get_batch_loss(model, batch)
+            loss = get_batch_loss(model, batch, train=False)
             if LOG:
                 writer.add_scalar('Loss/val', loss, i)
             print(f'validation loss: {loss.item()}')            

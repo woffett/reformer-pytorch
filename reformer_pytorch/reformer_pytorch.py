@@ -682,14 +682,8 @@ class SimHashLSHAttention(LSHAttention):
         
         ### BEGIN REPEATED CODE ###
         n_buckets = seqlen // self.bucket_size
-
         buckets = self.hash_vectors(n_buckets, qk) # batch x (num_hashes * seq_len)
         max_idxs = buckets.reshape(batch_size, -1, seqlen)
-        
-        offsets = torch.arange(self.n_hashes, device=device)
-        offsets = torch.reshape(offsets * n_buckets, (1, -1, 1))
-        max_idxs = max_idxs + offsets
-        buckets = torch.reshape(max_idxs, (batch_size, -1))
         ticker = torch.arange(self.n_hashes * seqlen, device=device).unsqueeze(0).expand_as(buckets)
         buckets_and_t = (seqlen * buckets + (ticker % seqlen)).detach()
         # sorted according to bucket id
@@ -738,7 +732,7 @@ class SimHashLSHAttention(LSHAttention):
         def pos_neg_examples(max_idxs, qk, bk):
             max_batches = batched_index_select2(bk, max_idxs)
             
-            # reshape to make dot product easier
+            # reshape to make dot proDuct easier
             max_batches = max_batches.reshape(batch_size, -1, self.n_hashes,
                                               seqlen // n_buckets * 2, dim)
 
@@ -807,8 +801,8 @@ class SimHashLSHAttention(LSHAttention):
         norm = torch.norm(hash_weight)
         if norm != self.rot_norm:
             print('Rotation updated!')
-            self.rot_norm = norm
-            self.simhash.rp = self.simhash.generate_from_weight(hash_weight)
+            self.rot_norm = norm.item()
+            self.simhash.rp = SimHash.generate_from_weight(hash_weight)
         else:
             print('Rotation still the same, not updating simhash')
     
@@ -920,7 +914,7 @@ class LSHSelfAttention(nn.Module):
         if self.attn_type in ['triplet', 'simhash'] and calc_triplet:
             pos_vectors, neg_vectors = process_inputs_chunk(
                 self.lsh_attn.triplet_examples,
-                qk, chunks=self.attn_chunks)
+                qk.detach(), chunks=self.attn_chunks)
             
             def chunked_loss(fn, *args, chunks=1, dim=0):
                 chunked_inputs = list(map(lambda x: x.chunk(chunks, dim=dim), args))
@@ -928,7 +922,7 @@ class LSHSelfAttention(nn.Module):
                 return sum(outputs)
             
             triplet_loss = chunked_loss(self.lsh_attn.triplet_forward,
-                                        qk, pos_vectors, neg_vectors,
+                                        qk.detach(), pos_vectors, neg_vectors,
                                         chunks=self.attn_chunks, dim=1)
             if self.triplet_loss is None:
                 self.triplet_loss = triplet_loss
