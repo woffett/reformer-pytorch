@@ -147,7 +147,8 @@ class LSHAttention(nn.Module):
                   rehash_each_round = True,
                   drop_for_hash_rate = 0.0,
                   random_rotations_per_head = False,
-                  return_attn = False):
+                  return_attn = False,
+                  store_stats = False):
         super().__init__()
         if dropout >= 1.0:
             raise ValueError('Dropout rates must be lower than 1.')
@@ -162,6 +163,11 @@ class LSHAttention(nn.Module):
         self.causal = causal
         self.n_hashes = n_hashes
         self.bucket_size = bucket_size
+        self.store_stats = store_stats
+        self.noninfs = 0.0
+        self.mean_dp = 0.0
+        self.var_dp = 0.0
+        self.stat_count = 0
 
         self._allow_duplicate_attention = allow_duplicate_attention
         self._attend_across_buckets = attend_across_buckets
@@ -283,6 +289,23 @@ class LSHAttention(nn.Module):
         dots = torch.einsum('bhie,bhje->bhij', bq, bk) * (dim ** -0.5)
         masked_value = max_neg_value(dots)
 
+        # store mean
+        if self.store_stats:
+            mean = torch.mean(dots, dim=-1)
+            std = torch.std(dots, dim=-1)
+            noninfs = torch.mean(torch.sum(dots > masked_value, dim=-1).float())
+            # need to average over batch size
+            self.noninfs = (
+                (self.noninfs * self.stat_count) + noninfs.item()
+            ) / (self.stat_count + 1)
+            self.mean_dp = (
+                (self.mean_dp * self.stat_count) + torch.mean(mean).item()
+            ) / (self.stat_count+1)
+            self.var_dp = (
+                (self.var_dp *  self.stat_count) + torch.mean(std ** 2).item()
+            ) / (self.stat_count+1)
+            self.stat_count += 1
+
         # Input mask for padding in variable lengthed sequences
         if input_mask is not None:
             input_mask = F.pad(input_mask, (0, seqlen - input_mask.shape[1]), 'constant', True)
@@ -299,7 +322,7 @@ class LSHAttention(nn.Module):
             del mask
 
         # Mask out attention to self except when no other targets are available.
-        self_mask = bq_t[:, :, :, None] == bkv_t[:, :, None, :]        
+        self_mask = bq_t[:, :, :, None] == bkv_t[:, :, None, :]
         dots.masked_fill_(self_mask, TOKEN_SELF_ATTN_VALUE)
         del self_mask
 
@@ -410,7 +433,8 @@ class TripletLSHAttention(LSHAttention):
                  drop_for_hash_rate = 0.0,
                  random_rotations_per_head = False,
                  return_attn = False,
-                 triplet_chunks = None
+                 triplet_chunks = None,
+                 store_stats = False
     ):
         super().__init__(dropout = dropout,
                          bucket_size = bucket_size,
@@ -421,7 +445,8 @@ class TripletLSHAttention(LSHAttention):
                          rehash_each_round = rehash_each_round,
                          drop_for_hash_rate = drop_for_hash_rate,
                          random_rotations_per_head = random_rotations_per_head,
-                         return_attn = return_attn)
+                         return_attn = return_attn,
+                         store_stats = store_stats)
         self.alpha = alpha
         self.seq_len = seq_len
         self.heads = heads
@@ -584,7 +609,6 @@ class TripletLSHAttention(LSHAttention):
                                              input_mask = input_mask,
                                              rotations = rotations,
                                              printgrad = printgrad)
-            
         return out, attn, buckets
 
 # simple full attention
@@ -730,12 +754,12 @@ class FeedForward(nn.Module):
 # reformer lm
 
 class Reformer(nn.Module):
-    def __init__(self, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., lsh_attend_across_buckets = True, lsh_allow_duplicate_attention = True, random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, attn_type = 'lsh', full_attn_thres = None, num_mem_kv = 0, batch = None, triplet_chunks = None):
+    def __init__(self, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., lsh_attend_across_buckets = True, lsh_allow_duplicate_attention = True, random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, attn_type = 'lsh', full_attn_thres = None, num_mem_kv = 0, batch = None, triplet_chunks = None, store_stats = False):
         super().__init__()
         self.dim = dim
         self.depth = depth
 
-        get_attn = lambda: SettableArgs(LSHSelfAttention(dim, heads, bucket_size, n_hashes, causal = causal, dropout = lsh_dropout, attn_chunks = attn_chunks, allow_duplicate_attention = lsh_allow_duplicate_attention, attend_across_buckets = lsh_attend_across_buckets, random_rotations_per_head = random_rotations_per_head, num_mem_kv = num_mem_kv, attn_type = attn_type, full_attn_thres = full_attn_thres, max_seq_len = max_seq_len, batch = batch, triplet_chunks = triplet_chunks))
+        get_attn = lambda: SettableArgs(LSHSelfAttention(dim, heads, bucket_size, n_hashes, causal = causal, dropout = lsh_dropout, attn_chunks = attn_chunks, allow_duplicate_attention = lsh_allow_duplicate_attention, attend_across_buckets = lsh_attend_across_buckets, random_rotations_per_head = random_rotations_per_head, num_mem_kv = num_mem_kv, attn_type = attn_type, full_attn_thres = full_attn_thres, max_seq_len = max_seq_len, batch = batch, triplet_chunks = triplet_chunks, store_stats = store_stats))
         get_ff = lambda: FeedForward(dim)
 
         if weight_tie:
@@ -772,7 +796,7 @@ class Reformer(nn.Module):
         return torch.stack(x.chunk(2, dim=-1)).sum(dim=0)
 
 class ReformerLM(nn.Module):
-    def __init__(self, num_tokens, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, attn_type = 'lsh', full_attn_thres = None, num_mem_kv = 0, emb_dim = None, return_embeddings = False, fixed_position_emb = False, batch = None, triplet_chunks = None):
+    def __init__(self, num_tokens, dim, depth, max_seq_len, heads = 8, bucket_size = 64, n_hashes = 8, ff_chunks = 100, attn_chunks = None, causal = False, weight_tie = False, lsh_dropout = 0., random_rotations_per_head = False, twin_attention = False, use_scale_norm = False, attn_type = 'lsh', full_attn_thres = None, num_mem_kv = 0, emb_dim = None, return_embeddings = False, fixed_position_emb = False, batch = None, triplet_chunks = None, store_stats = False):
         super().__init__()
         emb_dim = default(emb_dim, dim)
         self.token_emb = nn.Embedding(num_tokens, emb_dim)
@@ -780,7 +804,7 @@ class ReformerLM(nn.Module):
         self.to_model_dim = identity if emb_dim == dim else nn.Linear(emb_dim, dim)
         self.dim = dim
 
-        self.reformer = Reformer(dim, depth, max_seq_len, heads = heads, bucket_size = bucket_size, n_hashes = n_hashes, ff_chunks = ff_chunks, attn_chunks = attn_chunks, causal = causal, weight_tie = weight_tie, lsh_dropout = lsh_dropout, random_rotations_per_head = random_rotations_per_head, twin_attention = twin_attention, use_scale_norm = use_scale_norm, attn_type = attn_type, full_attn_thres = full_attn_thres, num_mem_kv = num_mem_kv, batch = batch, triplet_chunks = triplet_chunks)
+        self.reformer = Reformer(dim, depth, max_seq_len, heads = heads, bucket_size = bucket_size, n_hashes = n_hashes, ff_chunks = ff_chunks, attn_chunks = attn_chunks, causal = causal, weight_tie = weight_tie, lsh_dropout = lsh_dropout, random_rotations_per_head = random_rotations_per_head, twin_attention = twin_attention, use_scale_norm = use_scale_norm, attn_type = attn_type, full_attn_thres = full_attn_thres, num_mem_kv = num_mem_kv, batch = batch, triplet_chunks = triplet_chunks, store_stats = store_stats)
         self.to_logits = identity if return_embeddings else nn.Linear(dim, num_tokens)
 
     def forward(self, x, **kwargs):
@@ -808,9 +832,26 @@ class ReformerLM(nn.Module):
         total = 0
         for i in range(len(self.reformer.layer_modules)//2):
             f = self.reformer.layer_modules[2*i].fn
+            attn_fn = f.lsh_attn
             if f.triplet_loss is not None:
                 total += f.triplet_loss
         return total
+
+    def get_statistics(self, batch_size):
+        means = []
+        variances = []
+        noninfs = []
+        for i in range(len(self.reformer.layer_modules)//2):
+            f = self.reformer.layer_modules[2*i].fn
+            attn_fn = f.lsh_attn
+            means.append(attn_fn.mean_dp / batch_size)
+            variances.append(attn_fn.var_dp / batch_size)
+            noninfs.append(attn_fn.noninfs / batch_size)
+            attn_fn.mean_dp = 0.0
+            attn_fn.variances = 0.0
+            attn_fn.noninfs = 0.0
+            attn_fn.stat_count = 0
+        return means, variances, noninfs
 
     def clear_triplet_loss(self):
         for i in range(len(self.reformer.layer_modules)//2):

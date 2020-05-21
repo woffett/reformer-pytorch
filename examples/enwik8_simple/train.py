@@ -76,10 +76,11 @@ model = ReformerLM(
     n_hashes = 4,
     ff_chunks = 10,
     lsh_dropout = 0.1,
-    weight_tie = True,
+    weight_tie = False,
     causal = True,
     # use_full_attn = False # set this to true for comparison with full attention
     attn_type = ATTN_TYPE,
+    store_stats = True,
     triplet_chunks = 512
 )
 
@@ -152,6 +153,12 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         triplet_optim.step()
         triplet_optim.zero_grad()
         model.clear_triplet_loss()
+
+    means, variances, noninfs = model.get_statistics(GRADIENT_ACCUMULATE_EVERY)
+    for j, (med, vari, noninf) in enumerate(zip(means, variances, noninfs)):
+        writer.add_scalar('Mean/train/%d' % j, med, i)
+        writer.add_scalar('Variance/train/%d' % j, vari, i)
+        writer.add_scalar('Noninfs/train/%d' % j, noninf, i)
     
     if i % VALIDATE_EVERY == 0:
         model.eval()
@@ -165,6 +172,12 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 writer.add_scalar('Loss/val_triplet', triplet_loss, i)
                 print(f'validation triplet loss: {triplet_loss.item()}')
                 model.clear_triplet_loss()
+
+            means, variances, noninfs = model.get_statistics(BATCH_SIZE)
+            for j, (med, vari, noninf) in enumerate(zip(means, variances, noninfs)):
+                writer.add_scalar('Mean/val/%d' % j, med, i)
+                writer.add_scalar('Variance/val/%d' % j, vari, i)
+                writer.add_scalar('Noninfs/val/%d' % j, noninf, i)  
 
     # if i % GENERATE_EVERY == 0:
     #     model.eval()
@@ -184,3 +197,4 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     #         print(output_str)
 
 writer.close()
+# torch.save(model.state_dict(), '4096_learned_64bsize_4rounds.pt')
