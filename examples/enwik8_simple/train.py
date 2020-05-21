@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 # constants
 
 # NUM_BATCHES = int(1e5)
-NUM_BATCHES = 100
+NUM_BATCHES = 10
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 1e-4
@@ -23,7 +23,8 @@ VALIDATE_EVERY  = 10
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 4096
-ATTN_TYPE = 'lsh'
+ATTN_TYPE = 'simhash'
+LOG = False
 SEED = 1
 
 # set random seeds
@@ -125,7 +126,8 @@ def get_batch_loss(model, data):
     return F.cross_entropy(pred.transpose(1, 2), y, reduction='mean')
 
 # generating Tensorboard writer
-writer = SummaryWriter()
+if LOG:
+    writer = SummaryWriter()
 
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
@@ -136,48 +138,55 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         loss.backward()
 
     print(f'training loss: {loss.item()}')
-    writer.add_scalar('Loss/train', loss, i)
+    if LOG:
+        writer.add_scalar('Loss/train', loss, i)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
 
     # now for triplet loss
-    if ATTN_TYPE == 'triplet':
+    if ATTN_TYPE in ['triplet', 'simhash']:
         triplet_loss = model.get_triplet_loss()
         # for logging, show mean loss
         print(f'training triplet loss: {triplet_loss.item()/GRADIENT_ACCUMULATE_EVERY}')
-        writer.add_scalar('Loss/train_triplet', triplet_loss/GRADIENT_ACCUMULATE_EVERY, i)
+        if LOG:
+            writer.add_scalar('Loss/train_triplet', triplet_loss/GRADIENT_ACCUMULATE_EVERY, i)
         triplet_loss.backward()
         model.clear_non_rotation_gradients()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         triplet_optim.step()
         triplet_optim.zero_grad()
         model.clear_triplet_loss()
+        model.update_simhash()
 
-    means, variances, noninfs = model.get_statistics(GRADIENT_ACCUMULATE_EVERY)
-    for j, (med, vari, noninf) in enumerate(zip(means, variances, noninfs)):
-        writer.add_scalar('Mean/train/%d' % j, med, i)
-        writer.add_scalar('Variance/train/%d' % j, vari, i)
-        writer.add_scalar('Noninfs/train/%d' % j, noninf, i)
+    if LOG:
+        means, variances, noninfs = model.get_statistics(GRADIENT_ACCUMULATE_EVERY)
+        for j, (med, vari, noninf) in enumerate(zip(means, variances, noninfs)):
+            writer.add_scalar('Mean/train/%d' % j, med, i)
+            writer.add_scalar('Variance/train/%d' % j, vari, i)
+            writer.add_scalar('Noninfs/train/%d' % j, noninf, i)
     
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
             batch = next(val_loader)
             loss = get_batch_loss(model, batch)
-            writer.add_scalar('Loss/val', loss, i)
+            if LOG:
+                writer.add_scalar('Loss/val', loss, i)
             print(f'validation loss: {loss.item()}')            
-            if ATTN_TYPE == 'triplet':
+            if ATTN_TYPE in ['triplet', 'simhash']:
                 triplet = model.get_triplet_loss()
-                writer.add_scalar('Loss/val_triplet', triplet_loss, i)
+                if LOG:
+                    writer.add_scalar('Loss/val_triplet', triplet_loss, i)
                 print(f'validation triplet loss: {triplet_loss.item()}')
                 model.clear_triplet_loss()
 
-            means, variances, noninfs = model.get_statistics(BATCH_SIZE)
-            for j, (med, vari, noninf) in enumerate(zip(means, variances, noninfs)):
-                writer.add_scalar('Mean/val/%d' % j, med, i)
-                writer.add_scalar('Variance/val/%d' % j, vari, i)
-                writer.add_scalar('Noninfs/val/%d' % j, noninf, i)  
+            if LOG:
+                means, variances, noninfs = model.get_statistics(BATCH_SIZE)
+                for j, (med, vari, noninf) in enumerate(zip(means, variances, noninfs)):
+                    writer.add_scalar('Mean/val/%d' % j, med, i)
+                    writer.add_scalar('Variance/val/%d' % j, vari, i)
+                    writer.add_scalar('Noninfs/val/%d' % j, noninf, i)  
 
     # if i % GENERATE_EVERY == 0:
     #     model.eval()

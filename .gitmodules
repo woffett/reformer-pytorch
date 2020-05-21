@@ -1,0 +1,3 @@
+[submodule "reformer_pytorch/learnLSH"]
+	path = reformer_pytorch/learnLSH
+	url = https://github.com/keroro824/learnLSH.git

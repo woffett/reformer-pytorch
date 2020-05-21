@@ -99,7 +99,7 @@ model = ReformerLM(
     weight_tie = False, # need to set this to false!
     causal = True,
     # use_full_attn = False, # set this to true for comparison with full attention
-    attn_type = 'triplet',
+    attn_type = 'simhash',
     store_stats = True,
     batch = BATCH_SIZE
 )
@@ -139,47 +139,44 @@ def get_batch_loss(model, data):
 batch = next(train_loader)
 x, y = batch
 
-loss = get_batch_loss(model, batch)
-means, variances, noninfs = model.get_statistics(1)
-
 # BELOW: testing code for figuring out how to calculate pos/neg examples for triplet loss
-# t = torch.arange(x.shape[1], device=x.device)
+t = torch.arange(x.shape[1], device=x.device)
 
-# # partial activation z
-# z = model.token_emb(x)
-# z = z + model.pos_emb(t).type(z.type())
-# z = model.to_model_dim(z)
+# partial activation z
+z = model.token_emb(x)
+z = z + model.pos_emb(t).type(z.type())
+z = model.to_model_dim(z)
 
-# target_layer = 1
+target_layer = 1
 
-# for i in range(0,target_layer*2,2):
-#     z = F.layer_norm(z, (model.dim,))
-#     zprime = model.reformer.layer_modules[i].fn(z)
-#     z = zprime + z
+for i in range(0,target_layer*2,2):
+    z = F.layer_norm(z, (model.dim,))
+    zprime = model.reformer.layer_modules[i].fn(z)
+    z = zprime + z
 
-# f = model.reformer.layer_modules[2 * target_layer].fn
+f = model.reformer.layer_modules[2 * target_layer].fn
 
     
-# b, t, e = z.shape
-# # f = model.reformer.layer_modules[6].fn
-# # g = model.reformer.layer_modules[7].fn
+b, t, e = z.shape
+# f = model.reformer.layer_modules[6].fn
+# g = model.reformer.layer_modules[7].fn
 
-# z = F.layer_norm(z, (model.dim,))
-# # y2 = g(z)
-# h = f.heads
-# qk = f.toqk(z)
-# v = f.tov(z)
-# kv_len = t
+z = F.layer_norm(z, (model.dim,))
+# y2 = g(z)
+h = f.heads
+qk = f.toqk(z)
+v = f.tov(z)
+kv_len = t
 
-# def merge_heads(v):
-#     return v.view(b, kv_len, h, -1).transpose(1, 2).reshape(b * h, kv_len, -1)
+def merge_heads(v):
+    return v.view(b, kv_len, h, -1).transpose(1, 2).reshape(b * h, kv_len, -1)
 
-# def split_heads(v):
-#     return v.view(b, h, t, -1).transpose(1, 2).contiguous()
+def split_heads(v):
+    return v.view(b, h, t, -1).transpose(1, 2).contiguous()
             
-# qk = merge_heads(qk)
-# v = merge_heads(v)
-# attn_fn = f.lsh_attn
+qk = merge_heads(qk)
+v = merge_heads(v)
+attn_fn = f.lsh_attn
 # prev_return_setting = attn_fn._return_attn
 # attn_fn._return_attn = True
 # partial_attn_fn = partial(attn_fn, query_len = t, input_mask = None)
@@ -187,45 +184,89 @@ means, variances, noninfs = model.get_statistics(1)
 #     out, attn, _ = process_inputs_chunk(partial_attn_fn,
 #                                         qk, v, chunks=f.attn_chunks)
 
-# # metrics: avg. (normalized) inner product within buckets
+# metrics: avg. (normalized) inner product within buckets
 
-# qk_chunks = qk.chunk(f.attn_chunks, dim=0)
-# v_chunks = v.chunk(f.attn_chunks, dim=0)
-# qk = qk_chunks[1]
-# v = v_chunks[1]
+qk_chunks = qk.chunk(f.attn_chunks, dim=0)
+v_chunks = v.chunk(f.attn_chunks, dim=0)
+qk = qk_chunks[1]
+v = v_chunks[1]
 
-# batch_size, seqlen, dim = qk.shape
-# query_len = seqlen
-# device = qk.device
-# n_buckets = seqlen // attn_fn.bucket_size
-# buckets = attn_fn.hash_vectors(n_buckets, qk, rotations = None)
+batch_size, seqlen, dim = qk.shape
+query_len = seqlen
+device = qk.device
+n_buckets = seqlen // attn_fn.bucket_size
+buckets = attn_fn.hash_vectors(n_buckets, qk, rotations = None)
+max_idxs = buckets.reshape(batch_size, -1, seqlen)
 
-# ticker = torch.arange(attn_fn.n_hashes * seqlen, device=device).unsqueeze(0).expand_as(buckets)
-# buckets_and_t = seqlen * buckets + (ticker % seqlen)
-# buckets_and_t = buckets_and_t.detach()
+ticker = torch.arange(attn_fn.n_hashes * seqlen, device=device).unsqueeze(0).expand_as(buckets)
+buckets_and_t = seqlen * buckets + (ticker % seqlen)
+buckets_and_t = buckets_and_t.detach()
 
-# sbuckets_and_t, sticker = sort_key_val(buckets_and_t, ticker, dim=-1)
-# _, undo_sort = sort_key_val(sticker, ticker, dim=-1)
-# del ticker
+sbuckets_and_t, sticker = sort_key_val(buckets_and_t, ticker, dim=-1)
+_, undo_sort = sort_key_val(sticker, ticker, dim=-1)
+del ticker
 
-# st = (sticker % seqlen)
-# sqk = batched_index_select(qk, st)
-# sv = batched_index_select(v, st)
+st = (sticker % seqlen)
+sqk = batched_index_select(qk, st)
 
-# chunk_size = attn_fn.n_hashes * n_buckets
-# bq_t = bkv_t = torch.reshape(st, (batch_size, chunk_size, -1))
-# bqk = torch.reshape(sqk, (batch_size, chunk_size, -1, dim))
-# bv = torch.reshape(sv, (batch_size, chunk_size, -1, dim))
-# bq = bqk
-# bk = F.normalize(bqk, p=2, dim=-1).type(bq.type())
+chunk_size = attn_fn.n_hashes * n_buckets
+bqk = torch.reshape(sqk, (batch_size, chunk_size, -1, dim))
 
-# def look_one_back(x):
-#     x_extra = torch.cat([x[:, -1:, ...], x[:, :-1, ...]], dim=1)
-#     return torch.cat([x, x_extra], dim=2)
+def look_one_back(x):
+    x_extra = torch.cat([x[:, -1:, ...], x[:, :-1, ...]], dim=1)
+    return torch.cat([x, x_extra], dim=2)
 
-# bk = look_one_back(bk)
-# bv = look_one_back(bv)
-# bkv_t = look_one_back(bkv_t)
+bk = look_one_back(bqk)
+
+# reshape min/max idxs to batch x (seqlen*n_hashes)
+max_idxs = torch.reshape(torch.transpose(max_idxs,-1,-2),
+                         (batch_size, -1))
+
+def batched_index_select2(values, indices):
+    last_dim = values.shape[-1]
+    snd_last_dim = values.shape[-2]
+    return values.gather(
+        1,
+        indices[:,:,None,None].expand(-1,-1,snd_last_dim, last_dim)
+    )
+
+def pos_neg_examples(max_idxs, qk, bk):
+    max_batches = batched_index_select2(bk, max_idxs)
+    
+    # reshape to make dot product easier
+    max_batches = max_batches.reshape(batch_size, -1, self.n_hashes,
+                                      seqlen // n_buckets * 2, dim)
+
+    # perform dot product between qk and the vectors it attends over
+    max_self_attn = torch.einsum('bthkd,btdz->bthkz', max_batches,
+                                 qk.unsqueeze(-1)).squeeze(-1)
+            
+    # find the indices of the maximum dot prod. across all n_hashes
+    max_self_attn_idxs = torch.argmax(
+        max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
+        dim=-1).unsqueeze(-1)        
+    min_self_attn_idxs = torch.argmin(
+        max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
+        dim=-1).unsqueeze(-1)
+
+    # select along second last dim
+    max_batches = max_batches.reshape(batch_size, -1,
+                                      self.n_hashes * seqlen // n_buckets * 2, dim)
+    pos_vectors = max_batches.gather(
+        2,
+        max_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
+    ).squeeze(-2)
+    neg_vectors = max_batches.gather(
+        2,
+        min_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
+    ).squeeze(-2)
+    # pos/neg_vectors have same shape as qk            
+    return pos_vectors.detach(), neg_vectors.detach()
+
+partial_select_fn = partial(pos_neg_examples, bk = bk)
+pos_vectors, neg_vectors = process_inputs_chunk(
+    partial_select_fn, max_idxs, qk, chunks=self.triplet_chunks, dim=1
+)
 
 # dots = torch.einsum('bhie,bhje->bhij', bq, bk) * (dim ** -0.5)
 
