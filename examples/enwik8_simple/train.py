@@ -13,18 +13,18 @@ from torch.utils.tensorboard import SummaryWriter
 # constants
 
 # NUM_BATCHES = int(1e5)
-NUM_BATCHES = 10
+NUM_BATCHES = 100
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 1e-4
-TRIPLET_LEARNING_RATE = 0.00075
+TRIPLET_LEARNING_RATE = 0.0001
 # VALIDATE_EVERY  = 100
 VALIDATE_EVERY  = 10
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 4096
 ATTN_TYPE = 'simhash'
-LOG = False
+LOG = True
 SEED = 1
 
 # set random seeds
@@ -207,5 +207,6 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
 
     #         print(output_str)
 
-writer.close()
-# torch.save(model.state_dict(), '4096_learned_64bsize_4rounds.pt')
+if LOG:
+    writer.close()
+torch.save(model.state_dict(), '4096_simhash_64bsize_4rounds.pt')

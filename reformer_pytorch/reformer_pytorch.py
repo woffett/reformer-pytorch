@@ -30,7 +30,12 @@ def batched_index_select(values, indices):
 def process_inputs_chunk(fn, *args, chunks=1, dim=0):
     chunked_inputs = list(map(lambda x: x.chunk(chunks, dim=dim), args))
     outputs = [fn(*input_pair) for input_pair in zip(*chunked_inputs)]
-    return tuple(map(lambda x: torch.cat(x, dim=dim), zip(*outputs)))
+    def cat_fn(x):
+        if x[0] is not None:
+            return torch.cat(x, dim=dim)
+        else:
+            return None
+    return tuple(map(cat_fn, zip(*outputs)))
 
 def chunked_sum(tensor, chunks=1):
     *orig_size, last_dim = tensor.shape
@@ -230,7 +235,7 @@ class LSHAttention(nn.Module):
 
         return buckets
 
-    def forward(self, qk, v, query_len = None, input_mask = None, rotations = None, printgrad = False):
+    def forward(self, qk, v, query_len = None, input_mask = None, rotations = None, printgrad = False, triplet_examples = False):
         batch_size, seqlen, dim = qk.shape
         query_len = default(query_len, seqlen)
         device = qk.device
@@ -238,6 +243,7 @@ class LSHAttention(nn.Module):
         n_buckets = seqlen // self.bucket_size
 
         buckets = self.hash_vectors(n_buckets, qk, rotations = rotations)
+        max_idxs = buckets.reshape(batch_size, -1, seqlen)
         # We use the same vector as both a query and a key.
         assert int(buckets.shape[1]) == self.n_hashes * seqlen
 
@@ -285,6 +291,61 @@ class LSHAttention(nn.Module):
         bv = look_one_back(bv)
         bkv_t = look_one_back(bkv_t)
 
+        # compute pos/neg examples for triplet loss        
+        if triplet_examples:
+            # reshape min/max idxs to batch x (seqlen*n_hashes)
+            max_idxs = torch.reshape(torch.transpose(max_idxs,-1,-2),
+                                     (batch_size, -1))
+            # batch index select over last two dimensions
+            def batched_index_select2(values, indices):
+                last_dim = values.shape[-1]
+                snd_last_dim = values.shape[-2]
+                return values.gather(
+                    1,
+                    indices[:,:,None,None].expand(-1,-1,snd_last_dim, last_dim)
+                )
+            def pos_neg_examples(max_idxs, qk, bk):
+                max_batches = batched_index_select2(bk, max_idxs)
+            
+                # reshape to make dot proDuct easier
+                max_batches = max_batches.reshape(batch_size, -1, self.n_hashes,
+                                                  seqlen // n_buckets * 2, dim)
+
+                # perform dot product between qk and the vectors it attends over
+                max_self_attn = torch.einsum('bthkd,btdz->bthkz', max_batches,
+                                             qk.unsqueeze(-1)).squeeze(-1)
+            
+                # find the indices of the maximum dot prod. across all n_hashes
+                max_self_attn_idxs = torch.argmax(
+                    max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
+                    dim=-1).unsqueeze(-1)        
+                min_self_attn_idxs = torch.argmin(
+                    max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
+                    dim=-1).unsqueeze(-1)
+
+                # select along second last dim
+                max_batches = max_batches.reshape(batch_size, -1,
+                                                  self.n_hashes * seqlen // n_buckets * 2, dim)
+                pos_vectors = max_batches.gather(
+                    2,
+                    max_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
+                ).squeeze(-2)
+                neg_vectors = max_batches.gather(
+                    2,
+                    min_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
+                ).squeeze(-2)
+                # pos/neg_vectors have same shape as qk            
+                return pos_vectors.detach(), neg_vectors.detach()
+
+            # partial_select_fn = partial(pos_neg_examples, bk = bk)
+            # pos_vectors, neg_vectors = process_inputs_chunk(
+            #     partial_select_fn, max_idxs, qk, chunks=self.triplet_chunks, dim=1
+            # )
+            pos_vectors, neg_vectors = pos_neg_examples(max_idxs, qk, bk)
+        else:
+            pos_vectors = None
+            neg_vectors = None
+            
         # Dot-product attention.
         
         dots = torch.einsum('bhie,bhje->bhij', bq, bk) * (dim ** -0.5)
@@ -416,7 +477,7 @@ class LSHAttention(nn.Module):
             attn = torch.sum(unsorted_dots[:, :, 0:query_len, :] * probs, dim=1)
         
         # return output, attention matrix, and bucket distribution
-        return out, attn, buckets
+        return out, attn, buckets, pos_vectors, neg_vectors
 
 class TripletLSHAttention(LSHAttention):
     def __init__(self,
@@ -466,112 +527,6 @@ class TripletLSHAttention(LSHAttention):
         rotations = rotations.unsqueeze(0).expand(batch_size, -1, -1, -1)
         return rotations
 
-    def triplet_examples(self, qk):
-        '''
-        Given a query vector, extract the highest/lower inner-product
-        vectors from its LSH-sampled self-attention matrix
-        '''
-        batch_size, seqlen, dim = qk.shape
-        device = qk.device
-        rotations = self.extract_rotations(batch_size)
-        # compute the rotated vecs from hash_vectors
-        # | - there's repeated code here, I will clean it up later
-        # | - pretty much the same as LSHAttention forward, except with max/min idxs
-        
-        ### BEGIN REPEATED CODE ###
-        dropped_vecs = self.dropout_for_hash(qk)
-        rotated_vecs = torch.einsum('btf,bfhi->bhti', dropped_vecs, rotations)
-        max_idxs = torch.argmax(rotated_vecs, dim=-1) 
-
-        n_buckets = seqlen // self.bucket_size
-        offsets = torch.arange(self.n_hashes, device=device)
-        offsets = torch.reshape(offsets * n_buckets, (1, -1, 1))
-        max_idxs = max_idxs + offsets
-        buckets = torch.reshape(max_idxs, (batch_size, -1))
-        ticker = torch.arange(self.n_hashes * seqlen, device=device).unsqueeze(0).expand_as(buckets)
-        buckets_and_t = (seqlen * buckets + (ticker % seqlen)).detach()
-        # sorted according to bucket id
-        sbuckets_and_t, sticker = sort_key_val(buckets_and_t, ticker, dim=-1)
-        del ticker
-
-        # detaching
-        sbuckets_and_t = sbuckets_and_t.detach()
-        sticker = sticker.detach()
-
-        st = (sticker % seqlen)
-        sqk = batched_index_select(qk, st)
-
-        # split off the bin axis
-        chunk_size = self.n_hashes * n_buckets
-        bqk = torch.reshape(sqk, (batch_size, chunk_size, -1, dim))
-
-        # Allow each chunk to attend within itself, and also one chunk back. Chunk
-        # boundaries might occur in the middle of a sequence of items from the
-        # same bucket, so this increases the chances of attending to relevant items.
-        def look_one_back(x):
-            x_extra = torch.cat([x[:, -1:, ...], x[:, :-1, ...]], dim=1)
-            return torch.cat([x, x_extra], dim=2)
-        
-        bk = look_one_back(bqk)
-        del sqk
-        del bqk
-        ### END REPEATED CODE ###
-        # now, bk has shape (batch x C x S x dim)
-        #  - C = n_hashes * n_buckets, the number of chunks to attend over
-        #  - S = 2 * seqlen / n_buckets, chunks concat'd w/ prev. chunk
-
-        # reshape min/max idxs to batch x (seqlen*n_hashes)
-        max_idxs = torch.reshape(torch.transpose(max_idxs,-1,-2),
-                                 (batch_size, -1))
-        
-        # batch index select over last two dimensions
-        def batched_index_select2(values, indices):
-            last_dim = values.shape[-1]
-            snd_last_dim = values.shape[-2]
-            return values.gather(
-                1,
-                indices[:,:,None,None].expand(-1,-1,snd_last_dim, last_dim)
-            )
-
-        def pos_neg_examples(max_idxs, qk, bk):
-            max_batches = batched_index_select2(bk, max_idxs)
-            
-            # reshape to make dot product easier
-            max_batches = max_batches.reshape(batch_size, -1, self.n_hashes,
-                                              seqlen // n_buckets * 2, dim)
-
-            # perform dot product between qk and the vectors it attends over
-            max_self_attn = torch.einsum('bthkd,btdz->bthkz', max_batches,
-                                         qk.unsqueeze(-1)).squeeze(-1)
-            
-            # find the indices of the maximum dot prod. across all n_hashes
-            max_self_attn_idxs = torch.argmax(
-                max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
-                dim=-1).unsqueeze(-1)        
-            min_self_attn_idxs = torch.argmin(
-                max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
-                dim=-1).unsqueeze(-1)
-
-            # select along second last dim
-            max_batches = max_batches.reshape(batch_size, -1,
-                                              self.n_hashes * seqlen // n_buckets * 2, dim)
-            pos_vectors = max_batches.gather(
-            2,
-            max_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
-            ).squeeze(-2)
-            neg_vectors = max_batches.gather(
-                2,
-                min_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
-            ).squeeze(-2)
-            # pos/neg_vectors have same shape as qk            
-            return pos_vectors.detach(), neg_vectors.detach()
-
-        partial_select_fn = partial(pos_neg_examples, bk = bk)
-        pos_vectors, neg_vectors = process_inputs_chunk(
-            partial_select_fn, max_idxs, qk, chunks=self.triplet_chunks, dim=1
-        )
-        return pos_vectors, neg_vectors
-
     def triplet_forward(self,
                         x, # input
                         p, # positive example
@@ -600,16 +555,18 @@ class TripletLSHAttention(LSHAttention):
                                             torch.zeros(triplet_loss.size()).to(x.device)))
         return triplet_loss
 
-    def forward(self, qk, v, query_len = None, input_mask = None, printgrad = False):
+    def forward(self, qk, v, query_len = None, input_mask = None, printgrad = False,
+                triplet_examples = False):
         batch_size, seqlen, dim = qk.shape
         n_buckets = self.seq_len // self.bucket_size
         rotations = self.extract_rotations(batch_size)
-        out, attn, buckets = super().forward(qk, v,
-                                             query_len = query_len,
-                                             input_mask = input_mask,
-                                             rotations = rotations,
-                                             printgrad = printgrad)
-        return out, attn, buckets
+        out, attn, buckets, pos, neg = super().forward(qk, v,
+                                                       query_len = query_len,
+                                                       input_mask = input_mask,
+                                                       rotations = rotations,
+                                                       printgrad = printgrad,
+                                                       triplet_examples = triplet_examples)
+        return out, attn, buckets, pos, neg
 
 class SimHashLSHAttention(LSHAttention):
     def __init__(self,
@@ -669,105 +626,6 @@ class SimHashLSHAttention(LSHAttention):
         buckets = torch.reshape(buckets + offsets, (batch_size, -1))
         return buckets
 
-    def triplet_examples(self, qk):
-        '''
-        Given a query vector, extract the highest/lower inner-product
-        vectors from its LSH-sampled self-attention matrix
-        '''
-        batch_size, seqlen, dim = qk.shape
-        device = qk.device
-        # compute the rotated vecs from hash_vectors
-        # | - there's repeated code here, I will clean it up later
-        # | - pretty much the same as LSHAttention forward, except with max/min idxs
-        
-        ### BEGIN REPEATED CODE ###
-        n_buckets = seqlen // self.bucket_size
-        buckets = self.hash_vectors(n_buckets, qk) # batch x (num_hashes * seq_len)
-        max_idxs = buckets.reshape(batch_size, -1, seqlen)
-        ticker = torch.arange(self.n_hashes * seqlen, device=device).unsqueeze(0).expand_as(buckets)
-        buckets_and_t = (seqlen * buckets + (ticker % seqlen)).detach()
-        # sorted according to bucket id
-        sbuckets_and_t, sticker = sort_key_val(buckets_and_t, ticker, dim=-1)
-        del ticker
-
-        # detaching
-        sbuckets_and_t = sbuckets_and_t.detach()
-        sticker = sticker.detach()
-
-        st = (sticker % seqlen)
-        sqk = batched_index_select(qk, st)
-
-        # split off the bin axis
-        chunk_size = self.n_hashes * n_buckets
-        bqk = torch.reshape(sqk, (batch_size, chunk_size, -1, dim))
-
-        # Allow each chunk to attend within itself, and also one chunk back. Chunk
-        # boundaries might occur in the middle of a sequence of items from the
-        # same bucket, so this increases the chances of attending to relevant items.
-        def look_one_back(x):
-            x_extra = torch.cat([x[:, -1:, ...], x[:, :-1, ...]], dim=1)
-            return torch.cat([x, x_extra], dim=2)
-        
-        bk = look_one_back(bqk)
-        del sqk
-        del bqk
-        ### END REPEATED CODE ###
-        # now, bk has shape (batch x C x S x dim)
-        #  - C = n_hashes * n_buckets, the number of chunks to attend over
-        #  - S = 2 * seqlen / n_buckets, chunks concat'd w/ prev. chunk
-
-        # reshape min/max idxs to batch x (seqlen*n_hashes)
-        max_idxs = torch.reshape(torch.transpose(max_idxs,-1,-2),
-                                 (batch_size, -1))
-        
-        # batch index select over last two dimensions
-        def batched_index_select2(values, indices):
-            last_dim = values.shape[-1]
-            snd_last_dim = values.shape[-2]
-            return values.gather(
-                1,
-                indices[:,:,None,None].expand(-1,-1,snd_last_dim, last_dim)
-            )
-
-        def pos_neg_examples(max_idxs, qk, bk):
-            max_batches = batched_index_select2(bk, max_idxs)
-            
-            # reshape to make dot proDuct easier
-            max_batches = max_batches.reshape(batch_size, -1, self.n_hashes,
-                                              seqlen // n_buckets * 2, dim)
-
-            # perform dot product between qk and the vectors it attends over
-            max_self_attn = torch.einsum('bthkd,btdz->bthkz', max_batches,
-                                         qk.unsqueeze(-1)).squeeze(-1)
-            
-            # find the indices of the maximum dot prod. across all n_hashes
-            max_self_attn_idxs = torch.argmax(
-                max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
-                dim=-1).unsqueeze(-1)        
-            min_self_attn_idxs = torch.argmin(
-                max_self_attn.reshape(batch_size, -1, self.n_hashes * seqlen // n_buckets * 2),
-                dim=-1).unsqueeze(-1)
-
-            # select along second last dim
-            max_batches = max_batches.reshape(batch_size, -1,
-                                              self.n_hashes * seqlen // n_buckets * 2, dim)
-            pos_vectors = max_batches.gather(
-            2,
-            max_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
-            ).squeeze(-2)
-            neg_vectors = max_batches.gather(
-                2,
-                min_self_attn_idxs[:,:,:,None].expand(-1,-1, -1, dim)
-            ).squeeze(-2)
-            # pos/neg_vectors have same shape as qk            
-            return pos_vectors.detach(), neg_vectors.detach()
-
-        partial_select_fn = partial(pos_neg_examples, bk = bk)
-        pos_vectors, neg_vectors = process_inputs_chunk(
-            partial_select_fn, max_idxs, qk, chunks=self.triplet_chunks, dim=1
-        )
-        return pos_vectors, neg_vectors
-
     def triplet_forward(self,
                         x, # input
                         p, # positive example
@@ -799,12 +657,12 @@ class SimHashLSHAttention(LSHAttention):
     def update_simhash(self):
         hash_weight = self.rotations.weight.t().detach()
         norm = torch.norm(hash_weight)
-        if norm != self.rot_norm:
-            print('Rotation updated!')
-            self.rot_norm = norm.item()
-            self.simhash.rp = SimHash.generate_from_weight(hash_weight)
-        else:
-            print('Rotation still the same, not updating simhash')
+        # if norm != self.rot_norm:
+        #     print('Rotation updated!')
+        #     self.rot_norm = norm.item()
+        #     self.simhash.rp = SimHash.generate_from_weight(hash_weight)
+        # else:
+        #     print('Rotation still the same, not updating simhash')
     
 # simple full attention
 
@@ -841,7 +699,7 @@ class FullQKAttention(nn.Module):
         dot = dot.softmax(dim=-1)
         out = torch.einsum('bij,bje->bie', dot, v)
 
-        return out, dot, torch.empty(0)
+        return out, dot, torch.empty(0), None, None
 
 # Shared qk attention, using either full or LSH attention
 
@@ -903,26 +761,25 @@ class LSHSelfAttention(nn.Module):
         v = merge_heads(v)
 
         attn_fn = self.full_attn if use_full_attn else self.lsh_attn
-        partial_attn_fn = partial(attn_fn, query_len = t, input_mask = input_mask)
-        out, attn, buckets = process_inputs_chunk(partial_attn_fn,
-                                                  qk, v, chunks=self.attn_chunks)
+        return_triplet_examples = (self.attn_type in ['triplet', 'simhash']) and calc_triplet
+        partial_attn_fn = partial(attn_fn, query_len = t, input_mask = input_mask,
+                                  triplet_examples = return_triplet_examples)
+        
+        out, attn, buckets, pos, neg = process_inputs_chunk(partial_attn_fn,
+                                                            qk, v, chunks=self.attn_chunks)
         out = split_heads(out).view(b, t, e)
 
         if self.callback is not None:
             self.callback(attn.reshape(b, h, t, -1), buckets.reshape(b, h, -1))
 
-        if self.attn_type in ['triplet', 'simhash'] and calc_triplet:
-            pos_vectors, neg_vectors = process_inputs_chunk(
-                self.lsh_attn.triplet_examples,
-                qk.detach(), chunks=self.attn_chunks)
-            
+        if return_triplet_examples:            
             def chunked_loss(fn, *args, chunks=1, dim=0):
                 chunked_inputs = list(map(lambda x: x.chunk(chunks, dim=dim), args))
                 outputs = [fn(*inputs) for inputs in zip(*chunked_inputs)]
                 return sum(outputs)
             
             triplet_loss = chunked_loss(self.lsh_attn.triplet_forward,
-                                        qk.detach(), pos_vectors, neg_vectors,
+                                        qk.detach(), pos, neg,
                                         chunks=self.attn_chunks, dim=1)
             if self.triplet_loss is None:
                 self.triplet_loss = triplet_loss
