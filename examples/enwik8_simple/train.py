@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 # constants
 
 # NUM_BATCHES = int(1e5)
-NUM_BATCHES = 100
+NUM_BATCHES = 1000
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 1e-4
@@ -23,7 +23,7 @@ VALIDATE_EVERY  = 10
 GENERATE_EVERY  = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 4096
-ATTN_TYPE = 'simhash'
+ATTN_TYPE = 'lsh'
 LOG = True
 SEED = 1
 
@@ -162,11 +162,10 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
         model.update_simhash()
 
     if LOG:
-        means, variances, noninfs = model.get_statistics(GRADIENT_ACCUMULATE_EVERY)
-        for j, (med, vari, noninf) in enumerate(zip(means, variances, noninfs)):
+        means, variances = model.get_statistics(GRADIENT_ACCUMULATE_EVERY)
+        for j, (med, vari) in enumerate(zip(means, variances)):
             writer.add_scalar('Mean/train/%d' % j, med, i)
             writer.add_scalar('Variance/train/%d' % j, vari, i)
-            writer.add_scalar('Noninfs/train/%d' % j, noninf, i)
     
     if i % VALIDATE_EVERY == 0:
         model.eval()
@@ -184,11 +183,10 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 model.clear_triplet_loss()
 
             if LOG:
-                means, variances, noninfs = model.get_statistics(BATCH_SIZE)
-                for j, (med, vari, noninf) in enumerate(zip(means, variances, noninfs)):
+                means, variances = model.get_statistics(BATCH_SIZE)
+                for j, (med, vari) in enumerate(zip(means, variances)):
                     writer.add_scalar('Mean/val/%d' % j, med, i)
                     writer.add_scalar('Variance/val/%d' % j, vari, i)
-                    writer.add_scalar('Noninfs/val/%d' % j, noninf, i)  
 
     # if i % GENERATE_EVERY == 0:
     #     model.eval()
@@ -209,4 +207,4 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
 
 if LOG:
     writer.close()
-torch.save(model.state_dict(), '4096_simhash_64bsize_4rounds.pt')
+# torch.save(model.state_dict(), '4096_polytope_64bsize_4rounds.pt')

@@ -170,7 +170,6 @@ class LSHAttention(nn.Module):
         self.n_hashes = n_hashes
         self.bucket_size = bucket_size
         self.store_stats = store_stats
-        self.noninfs = 0.0
         self.mean_dp = 0.0
         self.var_dp = 0.0
         self.stat_count = 0
@@ -353,13 +352,10 @@ class LSHAttention(nn.Module):
 
         # store mean
         if self.store_stats:
-            mean = torch.mean(dots, dim=-1)
-            std = torch.std(dots, dim=-1)
-            noninfs = torch.mean(torch.sum(dots > masked_value, dim=-1).float())
+            normalized = F.normalize(dots, dim=-1)
+            mean = torch.mean(normalized, dim=-1)
+            std = torch.std(normalized, dim=-1)
             # need to average over batch size
-            self.noninfs = (
-                (self.noninfs * self.stat_count) + noninfs.item()
-            ) / (self.stat_count + 1)
             self.mean_dp = (
                 (self.mean_dp * self.stat_count) + torch.mean(mean).item()
             ) / (self.stat_count+1)
@@ -906,18 +902,15 @@ class ReformerLM(nn.Module):
     def get_statistics(self, batch_size):
         means = []
         variances = []
-        noninfs = []
         for i in range(len(self.reformer.layer_modules)//2):
             f = self.reformer.layer_modules[2*i].fn
             attn_fn = f.lsh_attn
             means.append(attn_fn.mean_dp / batch_size)
             variances.append(attn_fn.var_dp / batch_size)
-            noninfs.append(attn_fn.noninfs / batch_size)
             attn_fn.mean_dp = 0.0
             attn_fn.variances = 0.0
-            attn_fn.noninfs = 0.0
             attn_fn.stat_count = 0
-        return means, variances, noninfs
+        return means, variances
 
     def clear_triplet_loss(self):
         for i in range(len(self.reformer.layer_modules)//2):
